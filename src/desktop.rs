@@ -45,6 +45,7 @@ impl ClipboardHandle {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ClipboardMode {
     pub to_server: bool,
     pub to_client: bool,

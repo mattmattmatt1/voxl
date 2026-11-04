@@ -1,0 +1,60 @@
+# Plasma 6 on a virtual KWin screen. Built on the headless Wayland image
+# so the voxl binary and its libraries stay the same.
+FROM voxl-wayland
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        plasma-desktop \
+        konsole \
+        xdg-desktop-portal-kde \
+        breeze-icon-theme \
+        fonts-noto-core \
+        mesa-libgallium \
+        libegl1 \
+        libgl1 \
+    && setcap -r /usr/bin/kwin_wayland \
+    && rm -rf /var/lib/apt/lists/*
+
+# A Plasma application set. Firefox is a snap stub on this Ubuntu, so the
+# browser is Falkon. File capabilities on kwin_wayland make execve return
+# EPERM inside Docker; KWin runs without them. Falkon's postinst links a Qt5
+# dictionary directory that nothing else creates.
+RUN mkdir -p /usr/share/qt5 \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        dolphin dolphin-plugins \
+        kate \
+        systemsettings \
+        plasma-systemmonitor \
+        plasma-discover \
+        packagekit \
+        ark \
+        gwenview \
+        okular okular-extra-backends \
+        kde-spectacle \
+        elisa \
+        haruna \
+        kcalc \
+        kcharselect \
+        khelpcenter \
+        kinfocenter \
+        kwalletmanager \
+        partitionmanager \
+        kmahjongg kmines kpat ksudoku \
+        libreoffice-writer libreoffice-calc libreoffice-impress \
+        libreoffice-kf6 libreoffice-plasma libreoffice-style-breeze \
+        falkon \
+        kdialog \
+        kubuntu-wallpapers \
+        plasma-workspace-wallpapers \
+        kimageformat6-plugins \
+        ffmpegthumbs \
+        kdegraphics-thumbnailers \
+        kio-extras \
+        phonon4qt6-backend-vlc \
+        breeze-gtk-theme \
+        fonts-noto-color-emoji \
+        fonts-liberation \
+        fonts-ubuntu \
+        xdg-user-dirs \
+    && rm -rf /var/lib/apt/lists/*

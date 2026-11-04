@@ -20,6 +20,28 @@ let ws: WebSocket | null = null;
 let url = '';
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
+
+// One 2d context for the life of the transferred canvas. Firefox throws
+// "Cannot update created context to different thread" on a second getContext,
+// and also when desynchronized is set, so the first call that succeeds is kept.
+function context2d(
+	c: OffscreenCanvas
+): OffscreenCanvasRenderingContext2D | null {
+	const tries: CanvasRenderingContext2DSettings[] = [
+		{ alpha: false, desynchronized: true },
+		{ alpha: false },
+		{},
+	];
+	for (const opts of tries) {
+		try {
+			const got = c.getContext('2d', opts);
+			if (got) return got;
+		} catch {
+			/* this attribute set is refused; try a smaller one */
+		}
+	}
+	return null;
+}
 let audioDecoder: AudioDecoder | null = null;
 let audioPort: MessagePort | null = null;
 let audioTs = 0;
@@ -119,7 +141,7 @@ function onText(s: string) {
 			canvas.width = m.w;
 			canvas.height = m.h;
 		}
-		ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+		if (!ctx) ctx = context2d(canvas);
 		layout = m.stripes && m.stripes.length ? m.stripes : [[0, m.h]];
 		resetDecoder();
 	}
@@ -359,7 +381,7 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			canvas = m.canvas;
 			url = m.url;
 			presentToMain = m.presentToMain;
-			ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+			ctx = context2d(canvas);
 			connect();
 			break;
 		case 'send':

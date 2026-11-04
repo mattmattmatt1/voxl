@@ -1,5 +1,5 @@
-//! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from an
-//! X11 display on Linux or the screen of a Mac or a Windows machine.
+//! voxl: low-latency desktop streaming (H.264 over WebSocket) for the browser, from a
+//! Wayland or X11 display on Linux or the screen of a Mac or a Windows machine.
 //!
 //! The `voxl` binary calls [`run`] with its command line; other programs (the Tembo CLI's
 //! `tembo voxl`) embed the server the same way.
@@ -7,6 +7,8 @@
 mod access;
 #[cfg(target_os = "linux")]
 mod audio;
+#[cfg(target_os = "linux")]
+mod backend;
 #[cfg(target_os = "linux")]
 mod capture;
 mod convert;
@@ -31,6 +33,8 @@ mod screen;
 mod server;
 mod video;
 mod wait;
+#[cfg(target_os = "linux")]
+mod wl;
 #[cfg(windows)]
 mod win;
 
@@ -182,6 +186,33 @@ async fn serve(a: HashMap<String, String>) {
     };
     let audio_on = truthy(a.get("audio-enabled"), true);
 
+    // Wayland is the default on a Wayland session (Kubuntu, Fedora, Arch, …).
+    // X11 stays the default when there is no compositor, which is the Xvfb case.
+    #[cfg(target_os = "linux")]
+    let desktop = backend::init(a.get("backend").map(|s| s.as_str()));
+    #[cfg(target_os = "linux")]
+    if desktop == backend::Desktop::Wayland {
+        let label = if backend::explicit() {
+            "wayland"
+        } else {
+            "wayland (default)"
+        };
+        log::info!("desktop backend: {label}; asking the compositor to share the screen");
+        if let Err(e) = wl::start().await {
+            if backend::explicit() {
+                log::error!("wayland capture failed: {e}");
+                std::process::exit(1);
+            }
+            log::warn!(
+                "Wayland capture failed ({e}); falling back to X11. On a Wayland session that only shows Xwayland windows. Pass --backend=wayland to keep this error."
+            );
+            backend::force_x11();
+        }
+    } else {
+        let label = if backend::explicit() { "x11" } else { "x11 (default)" };
+        log::info!("desktop backend: {label}");
+    }
+
     let hub = hub::Hub::new();
     // --read-only: the viewer watches the desktop, it does not drive it. Only the
     // commands watching needs are accepted (see server::READ_ONLY_COMMANDS), uploads
@@ -189,9 +220,17 @@ async fn serve(a: HashMap<String, String>) {
     let read_only = truthy(a.get("read-only"), false);
     // --enable-resize (as in selkies): clients resize the desktop to their window. Not
     // for read-only viewers: a new size changes the desktop for everyone.
+    #[cfg(target_os = "linux")]
+    let mut enable_resize = truthy(a.get("enable-resize"), false);
+    #[cfg(not(target_os = "linux"))]
     let enable_resize = truthy(a.get("enable-resize"), false);
     if enable_resize && read_only {
         log::warn!("--enable-resize is ignored with --read-only: viewers can't resize the desktop");
+    }
+    #[cfg(target_os = "linux")]
+    if enable_resize && backend::get() == backend::Desktop::Wayland {
+        log::warn!("--enable-resize is not available on Wayland; the compositor owns the output size");
+        enable_resize = false;
     }
     let screen = (enable_resize && !read_only)
         .then(|| match screen::Screen::open(display.as_deref()) {
@@ -236,12 +275,30 @@ async fn serve(a: HashMap<String, String>) {
         .unwrap_or_default();
     if radius > 0 || !named.is_empty() {
         #[cfg(target_os = "linux")]
-        if let Err(e) = corners::spawn(display.clone(), radius, named) {
+        if backend::get() == backend::Desktop::Wayland {
+            log::info!("--round-corners/--round-windows apply to X11 desktops; skipped on Wayland");
+        } else if let Err(e) = corners::spawn(display.clone(), radius, named) {
             log::warn!("rounded corners unavailable: {e}");
         }
         #[cfg(not(target_os = "linux"))]
         log::info!("--round-corners/--round-windows only apply to X11 desktops");
     }
+    let px_per_notch = range_max(a.get("scroll-px-per-notch"), 180.0);
+    #[cfg(target_os = "linux")]
+    let input_tx = if backend::get() == backend::Desktop::Wayland {
+        wl::spawn_desktop(hub.clone(), clip_mode);
+        wl::spawn_input(clip_mode, px_per_notch)
+    } else {
+        let clipboard = match desktop::spawn(display.clone(), hub.clone(), clip_mode) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::error!("cursor/clipboard init failed: {e}");
+                None
+            }
+        };
+        input::spawn(display.clone(), clipboard, px_per_notch)
+    };
+    #[cfg(not(target_os = "linux"))]
     let clipboard = match desktop::spawn(display.clone(), hub.clone(), clip_mode) {
         Ok(h) => Some(h),
         Err(e) => {
@@ -249,8 +306,9 @@ async fn serve(a: HashMap<String, String>) {
             None
         }
     };
-    let px_per_notch = range_max(a.get("scroll-px-per-notch"), 180.0);
-    match input::spawn(display.clone(), clipboard, px_per_notch) {
+    #[cfg(not(target_os = "linux"))]
+    let input_tx = input::spawn(display.clone(), clipboard, px_per_notch);
+    match input_tx {
         Ok(tx) => *hub.input.lock() = Some(tx),
         Err(e) => log::error!("input init failed: {e}"),
     }

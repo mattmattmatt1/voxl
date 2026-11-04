@@ -4,12 +4,12 @@ name = "voxl-server"
 version = "0.3.2"
 edition = "2021"
 license = "MIT"
-description = "Low-latency desktop streaming for the browser: an X11 display, a Mac's screen or a Windows desktop as H.264 over a WebSocket"
+description = "Low-latency desktop streaming for the browser: a Wayland or X11 display, or a Mac or Windows screen, as H.264 over a WebSocket"
 repository = "https://github.com/tembo/voxl"
 readme = "README.md"
 # Lets programs that embed voxl read DEP_VOXL_RPATH (see build.rs).
 links = "voxl"
-keywords = ["remote-desktop", "streaming", "x11", "h264", "websocket"]
+keywords = ["remote-desktop", "streaming", "wayland", "h264", "websocket"]
 categories = ["command-line-utilities", "multimedia::video"]
 # What `cargo publish` uploads: the sources build.rs and the server need, nothing from bench/.
 include = [
@@ -61,9 +61,15 @@ zip = { version = "7", default-features = false, features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["fs", "poll", "time"] }
+nix = { version = "0.31", features = ["event", "fs", "poll", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = [
+	"tokio",
+	"screencast",
+	"remote_desktop",
+] }
+pipewire = "0.8"
 x11rb = { version = "0.13", features = [
 	"shm",
 	"damage",

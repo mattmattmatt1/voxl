@@ -2,19 +2,23 @@
 
 [![crates.io](https://img.shields.io/crates/v/voxl-server.svg)](https://crates.io/crates/voxl-server)
 
-Low-latency desktop streaming for the browser, written in Rust. voxl streams an X11
-display, a Mac's screen or a Windows desktop as H.264 over a WebSocket to a small web
+Low-latency desktop streaming for the browser, written in Rust. voxl streams a Wayland
+or X11 display, a Mac's screen or a Windows desktop as H.264 over a WebSocket to a small web
 client that decodes with WebCodecs, with input, clipboard, audio, microphone, file and
-folder transfer and dynamic resolution.
+folder transfer and dynamic resolution. On Linux, a Wayland session is the default;
+X11 is the default when there is no Wayland compositor (Xvfb included).
 
 ## Quick start
 
 ```sh
-cargo install voxl-server   # needs x264, libyuv, Opus, PulseAudio and esbuild (see Usage)
-DISPLAY=:1 voxl             # streams display :1 and prints a link that signs you in
+cargo install voxl-server   # needs x264, libyuv, Opus, PulseAudio, PipeWire and esbuild (see Usage)
+voxl                        # Wayland session: shares the screen through the desktop portal
+DISPLAY=:1 voxl             # X11 / Xvfb: streams that display
 ```
 
-Open the link it prints. On a Mac or a Windows PC, `voxl` streams that machine's own
+Open the link it prints. On a Wayland session the compositor asks you to share the
+screen (and, where the portal allows it, the keyboard and pointer). `--backend=x11`
+forces the X11 path. On a Mac or a Windows PC, `voxl` streams that machine's own
 screen instead; see [macOS](#macos) and [Windows](#windows).
 
 ## Benchmarks
@@ -100,6 +104,7 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
 
 | Flag                                                           | Default                            |                                                                                                                   |
 | -------------------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `--backend`                                                    | Wayland if `$WAYLAND_DISPLAY` is set, else X11 | `wayland` or `x11` (or `$VOXL_BACKEND`)                                                                |
 | `--addr`, `--port`                                             | `0.0.0.0`, `6901`                  | listen address                                                                                                    |
 | `--title`                                                      | `Voxl Computer Stream`             | the page's title: the browser tab, and the app's name if a viewer installs it                                     |
 | `--favicon`                                                    | voxl's icon                        | the tab's icon: an `.ico`, `.png`, `.gif`, `.webp` or `.svg` file                                                 |
@@ -280,8 +285,7 @@ over one WebSocket and has APIs for agents.
 TeamViewer and AnyDesk, for reaching your own computers or helping someone with theirs:
 you install its app on both ends, desktop or phone, and the two find each other through
 an ID server, then connect directly or through a relay. For that it's the better fit,
-and it also shares Wayland desktops (experimentally) and Android phones, which voxl
-doesn't. voxl is for desktops on servers, VMs and sandboxes: it's one process that
+and it also shares Android phones, which voxl doesn't. voxl is for desktops on servers, VMs and sandboxes: it's one process that
 serves its own page, so there's nothing to install on the viewing side and no ID or
 relay server to run. The stream goes wherever a URL does, can be embedded in another
 page and comes with the APIs agents use. RustDesk has a web client too, but it still
@@ -308,10 +312,14 @@ localhost:
 
 Phones and tablets get touch input and an on-screen keyboard.
 
-**Wayland?** Not yet; on Linux voxl streams X11 displays, Xvfb included. The virtual
-desktops voxl is built for run on Xvfb (E2B's and Daytona's do too), and X11 lets voxl
-capture them without a permission prompt, with damage events that keep a still screen at
-no CPU and power `/wait`. Wayland support is being worked on.
+**Wayland?** Yes, and it is the default when `WAYLAND_DISPLAY` is set (Kubuntu, Fedora
+Workstation, Arch, Debian GNOME, and the other desktops that start on Wayland). voxl
+asks the desktop portal for a screen cast and, when the compositor allows it, for the
+keyboard and pointer (`xdg-desktop-portal` RemoteDesktop + ScreenCast, frames over
+PipeWire). X11, including Xvfb, is still used when there is no Wayland compositor, or
+with `--backend=x11`. Dynamic resolution and `--round-corners` stay on the X11 path.
+The viewer's cursor is a local arrow; clipboard text goes through `wl-copy` /
+`wl-paste` or KDE Klipper.
 
 **Does it use the GPU?** Not yet. voxl encodes H.264 on the CPU with x264: 1.3–1.7 cores
 for a busy 2560x1600 desktop, X server included (see the CPU table above). Hardware
