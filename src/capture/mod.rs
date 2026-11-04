@@ -180,7 +180,8 @@ impl Capturer {
     }
 
     /// `false` means the grabbed pixels do not match the damage just taken (a newer
-    /// Wayland frame landed). The caller drops that damage and waits for the next one.
+    /// Wayland frame landed). The dirty macroblock map is left in place so the next
+    /// grab encodes those rects from the newest pixels.
     pub fn grab(&mut self, band: Band) -> Result<bool, String> {
         match &mut self.inner {
             Inner::X11(c) => {

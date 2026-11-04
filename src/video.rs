@@ -636,9 +636,10 @@ fn capture_loop(
                 }
             }
             if !held {
-                // The pixels moved on without this damage. Drop the map and wait.
-                bands.clear();
-                let _ = cap.take_mb_map();
+                // A newer Wayland frame landed before this copy. The dirty
+                // macroblocks stay set: the next grab encodes them from the
+                // newest pixels. Clearing the map left the previous picture
+                // on screen until a later sharpen happened to cover it.
                 continue;
             }
         }
@@ -731,16 +732,16 @@ fn capture_loop(
             refiner.clear_all();
         }
         // A refinement frame encodes what moved plus what is due; everything else stays skipped.
-        let mut job_bands = todo;
+        let mut sharpen: Option<Band> = None;
         let mb_map = if want_key {
             None
         } else if frame_paintover {
             paint_map.map(|(m, b)| {
-                push_band(&mut job_bands, b);
+                sharpen = Some(b);
                 Arc::new(m)
             })
         } else if let Some((rmap, rband)) = refine.take() {
-            push_band(&mut job_bands, rband);
+            sharpen = Some(rband);
             let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
             for (d, r) in m.iter_mut().zip(rmap) {
                 *d |= r;
@@ -750,6 +751,15 @@ fn capture_loop(
         } else {
             mb_dirty.take().map(Arc::new)
         };
+        let mut job_bands = todo;
+        if let Some(b) = sharpen {
+            // This buffer may still hold the motion-quality picture for rows
+            // that were not part of this grab. Convert them from the current
+            // frame, or the sharpen pass redraws the ghost it is meant to clear.
+            push_band(&mut job_bands, b);
+            push_band(&mut pending[1 - idx], b);
+            cap.convert(&mut buf, b.y0 as usize, b.y1 as usize, cfg.convert_threads);
+        }
         last_capture = t0;
         next_idx = 1 - idx;
         if job_tx

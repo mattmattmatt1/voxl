@@ -183,7 +183,8 @@ impl Capturer {
     }
 
     /// Swap in the frame `pump` observed. A newer serial means those damage rects
-    /// describe a frame we no longer have, so the caller drops them.
+    /// belong to a frame that is already gone; the caller keeps the macroblock map
+    /// and encodes it against the next frame it does grab.
     /// `band` selects rows for the X11 capturer; Wayland publishes a whole frame.
     pub fn grab(&mut self, _band: Band) -> Result<bool, String> {
         let mut frame = self.shared.frame.lock();
@@ -192,6 +193,10 @@ impl Capturer {
             return Ok(false);
         }
         if frame.serial != self.seen {
+            // pump already recorded this serial's rects. Keep the capture
+            // loop awake so the next pass encodes them against this frame.
+            self.damaged = true;
+            self.damaged_at.get_or_insert_with(Instant::now);
             return Ok(false);
         }
         if self.grabbed == self.seen {

@@ -20,9 +20,11 @@ let deskW = 0;
 let deskH = 0;
 let viewW = 0;
 let viewH = 0;
-/** One <video> write at a time. A newer frame waits and is acked with it. */
+/** One <video> write at a time. Newer pictures wait here and are acked once shown. */
 let presentBusy = false;
-let pendingAck = 0;
+/** Frame id posted to the page. -1 if nothing is in flight. */
+let inflightId = -1;
+let inflightT0 = 0;
 let accel: 'prefer-hardware' | 'prefer-software' = 'prefer-hardware';
 let accelFallback = false;
 let ws: WebSocket | null = null;
@@ -77,6 +79,14 @@ const stripes: StripeState[] = [];
 const frames = new Map<number, PendingFrame>();
 /** Frame ids awaiting presentation, oldest first. */
 const order: number[] = [];
+/**
+ * Newest decoded picture per stripe that is not on screen yet. A burst often
+ * puts the window-close on one stripe and a later small update on another;
+ * keeping only the last frame left the close invisible until a sharpen.
+ */
+const held: (StripeFrame | undefined)[] = [];
+let heldId = -1;
+let heldT0 = 0;
 let kfRequested = 0;
 const st = {
 	frames: 0,
@@ -169,6 +179,10 @@ function resetDecoder() {
 	for (const f of frames.values()) for (const g of f.got) g.frame.close();
 	frames.clear();
 	order.length = 0;
+	for (const g of held) if (g) g.frame.close();
+	held.length = 0;
+	heldId = -1;
+	inflightId = -1;
 }
 
 function requestKeyframe() {
@@ -270,50 +284,71 @@ function drawStripe(g: StripeFrame) {
 	g.frame.close();
 }
 
-/** Present the newest complete frames. Older complete ones are closed and covered by one ack. */
+/** Keep the newest picture for one stripe. An older one of the same stripe is closed. */
+function holdPart(g: StripeFrame) {
+	const prev = held[g.i];
+	if (prev) {
+		prev.frame.close();
+		st.dropped++;
+	}
+	held[g.i] = g;
+}
+
+function takeHeld(): StripeFrame[] {
+	const out: StripeFrame[] = [];
+	for (let i = 0; i < held.length; i++) {
+		const g = held[i];
+		if (!g) continue;
+		out.push(g);
+		held[i] = undefined;
+	}
+	return out;
+}
+
+/** Present every stripe's newest picture. The ack is the newest frame id. */
 function flush() {
-	const ready: { id: number; f: PendingFrame }[] = [];
 	while (order.length) {
 		const id = order[0];
 		const f = frames.get(id);
 		if (f && f.got.length < f.need) break;
 		order.shift();
 		frames.delete(id);
-		if (f) ready.push({ id, f });
+		if (!f) continue;
+		heldId = id;
+		heldT0 = f.t0;
+		for (const g of f.got) holdPart(g);
 	}
-	if (!ready.length) return;
-	const last = ready[ready.length - 1];
-	for (const r of ready) {
-		if (r === last) continue;
-		for (const g of r.f.got) g.frame.close();
-		st.dropped++;
-	}
-	const id = last.id;
-	const f = last.f;
+	if (heldId < 0) return;
 	if (presentToMain) {
-		if (presentBusy) {
-			for (const g of f.got) g.frame.close();
-			pendingAck = id;
-			return;
-		}
+		if (presentBusy) return;
+		const parts = takeHeld();
+		if (!parts.length) return;
 		presentBusy = true;
-		pendingAck = id;
-		post({ t: 'frames', id, parts: f.got }, f.got.map((g) => g.frame));
+		inflightId = heldId;
+		inflightT0 = heldT0;
+		heldId = -1;
+		post({ t: 'frames', id: inflightId, parts }, parts.map((g) => g.frame));
 		return;
 	}
-	for (const g of f.got) drawStripe(g);
+	const parts = takeHeld();
+	const id = heldId;
+	const t0 = heldT0;
+	heldId = -1;
+	for (const g of parts) drawStripe(g);
 	send(cmd.ack(id));
 	st.frames++;
-	st.decodeMs += performance.now() - f.t0;
+	st.decodeMs += performance.now() - t0;
 }
 
 function onPresented() {
 	presentBusy = false;
-	const id = pendingAck;
-	pendingAck = 0;
-	if (id) {
+	const id = inflightId;
+	const t0 = inflightT0;
+	inflightId = -1;
+	if (id >= 0) {
 		send(cmd.ack(id));
 		st.frames++;
+		st.decodeMs += performance.now() - t0;
 	}
 	flush();
 }
