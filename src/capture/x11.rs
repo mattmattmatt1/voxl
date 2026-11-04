@@ -13,6 +13,12 @@ use x11rb::rust_connection::RustConnection;
 
 pub static DAMAGE_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn debug_damage() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VOXL_DEBUG_DAMAGE").is_some())
+}
+
 pub struct ShmBuf {
     pub ptr: *mut u8,
     pub len: usize,
@@ -101,6 +107,7 @@ pub struct Capturer {
     acc: Option<(u32, u32)>,
     /// Macroblocks (16x16) touched since the last take, row-major.
     mb_dirty: Vec<u8>,
+    mb_spare: Vec<u8>,
     pub mb_cols: usize,
     /// Areas (x0, y0, x1, y1) changed since the video thread last took them, for `/wait`.
     pub changes: Vec<(u32, u32, u32, u32)>,
@@ -193,6 +200,7 @@ impl Capturer {
             damaged_at: None,
             acc: None,
             mb_dirty: vec![0; (width as usize).div_ceil(16) * (height as usize).div_ceil(16)],
+            mb_spare: Vec::new(),
             mb_cols: (width as usize).div_ceil(16),
             changes: Vec::new(),
         })
@@ -214,7 +222,7 @@ impl Capturer {
             }
             if let Event::DamageNotify(e) = ev {
                 DAMAGE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if std::env::var("VOXL_DEBUG_DAMAGE").is_ok() {
+                if debug_damage() {
                     log::info!(
                         "dmg {:?} x{} y{} {}x{}",
                         std::time::SystemTime::now()
@@ -257,6 +265,7 @@ impl Capturer {
 
     /// Take accumulated damage as a row band. Raw-rectangle reporting delivers the
     /// areas in the events themselves, so this never waits on the X server.
+    #[allow(dead_code)]
     pub fn take_damage(&mut self) -> Result<Option<Band>, String> {
         self.damaged = false;
         self.damaged_at = None;
@@ -270,10 +279,24 @@ impl Capturer {
         }))
     }
 
+    /// Dirty rows as separate spans. The macroblock map stays until [`Self::take_mb_map`].
+    pub fn take_bands(&mut self) -> Vec<Band> {
+        self.damaged = false;
+        self.damaged_at = None;
+        self.acc = None;
+        super::bands_from_mb(&self.mb_dirty, self.mb_cols, self.height)
+    }
+
     /// Take the dirty-macroblock map accumulated with the current damage.
     pub fn take_mb_map(&mut self) -> Vec<u8> {
         let n = self.mb_dirty.len();
-        std::mem::replace(&mut self.mb_dirty, vec![0; n])
+        let mut spare = std::mem::take(&mut self.mb_spare);
+        if spare.len() != n {
+            spare.resize(n, 0);
+        }
+        spare.fill(0);
+        std::mem::swap(&mut spare, &mut self.mb_dirty);
+        spare
     }
 
     pub fn full(&self) -> Band {

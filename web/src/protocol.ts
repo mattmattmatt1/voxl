@@ -120,7 +120,7 @@ export interface Stats {
 
 /** Worker -> page. Server messages other than ping and close are forwarded as is. */
 export type FromWorker =
-	| { t: 'frames'; parts: StripeFrame[] }
+	| { t: 'frames'; id: number; parts: StripeFrame[] }
 	| { t: 'status'; s: 'open' | 'closed' }
 	| { t: 'cursor'; buf: ArrayBuffer }
 	| { t: 'clipImage'; buf: ArrayBuffer }
@@ -131,6 +131,8 @@ export type FromWorker =
 /** Page -> worker. */
 export type ToWorker =
 	| { t: 'init'; canvas: OffscreenCanvas; url: string; presentToMain: boolean }
+	| { t: 'presented'; id: number }
+	| { t: 'view'; w: number; h: number }
 	| { t: 'send'; d: string }
 	| { t: 'sendBin'; d: ArrayBuffer }
 	| { t: 'video'; on: boolean }

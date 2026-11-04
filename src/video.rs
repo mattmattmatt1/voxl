@@ -36,22 +36,69 @@ struct Job {
     paintover: bool,
     /// Last pass of a paint-over burst.
     paintover_final: bool,
-    /// Rows that changed in this capture.
-    band: Option<Band>,
+    /// Rows that changed in this capture. Gaps between spans are left alone.
+    bands: Vec<Band>,
     /// Per-macroblock change map for this capture (None: analyse everything).
     mb_dirty: Option<Arc<Vec<u8>>>,
     captured_at: Instant,
     marker_ms: i64,
 }
 
-fn union(a: Option<Band>, b: Band) -> Band {
-    match a {
-        None => b,
-        Some(a) => Band {
-            y0: a.y0.min(b.y0),
-            y1: a.y1.max(b.y1),
-        },
+/// Merge `b` into `bands` when it touches an existing span. A gap stays a gap
+/// (`o.y1 < b.y0`), so two dirty regions do not convert the rows between them.
+fn push_band(bands: &mut Vec<Band>, mut b: Band) {
+    let mut i = 0;
+    while i < bands.len() {
+        let o = bands[i];
+        if o.y1 < b.y0 || b.y1 < o.y0 {
+            i += 1;
+            continue;
+        }
+        b.y0 = b.y0.min(o.y0);
+        b.y1 = b.y1.max(o.y1);
+        bands.swap_remove(i);
     }
+    bands.push(b);
+}
+
+fn band_hits(bands: &[Band], y: usize, h: usize) -> bool {
+    bands
+        .iter()
+        .any(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
+}
+
+/// A viewer can take another frame. A client stalled for 4s is reset once; the next
+/// call sees an empty window and returns true. Keyframes do not skip this check.
+fn client_ready(c: &crate::hub::Client, interval_ms: f64) -> bool {
+    let (n, age) = c.backlog();
+    if age > 4000 {
+        log::warn!(
+            "client {} stalled ({} frames, {} ms); resyncing",
+            c.id,
+            n,
+            age
+        );
+        c.inflight.lock().clear();
+        c.needs_keyframe.store(true, Ordering::Relaxed);
+        c.started.store(false, Ordering::Relaxed);
+        c.send(Out::DropVideo);
+        return false;
+    }
+    if n == 0 {
+        return true;
+    }
+    let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
+        0 => 40,
+        r => r,
+    } as f64;
+    let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
+    let max_age = rtt as u128 + 120;
+    n < max_n && age <= max_age
+}
+
+fn any_ready(hub: &Hub, interval_ms: f64) -> bool {
+    let clients = hub.video_clients();
+    clients.is_empty() || clients.iter().any(|c| client_ready(c, interval_ms))
 }
 
 /// One capture/encode setup for the current screen size.
@@ -167,9 +214,10 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
     *hub.stripes.lock() = layout;
     let hub2 = hub.clone();
     let (crf, po_crf) = (cfg.crf, cfg.paintover_crf);
+    let interval_ms = 1000.0 / cfg.fps.max(1) as f64;
     let encode = std::thread::Builder::new()
         .name("encode".into())
-        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf))
+        .spawn(move || encode_loop(stripes, job_rx, ret_tx, hub2, crf, po_crf, interval_ms))
         .unwrap();
     // New geometry (and a keyframe) for clients already connected; no-op at startup.
     hub.restart_clients();
@@ -179,39 +227,6 @@ fn build(cfg: &VideoConfig, hub: &Arc<Hub>) -> Result<Pipeline, String> {
         ret_rx,
         encode,
     })
-}
-
-fn flow_ok(hub: &Hub, interval_ms: f64) -> bool {
-    for c in hub.video_clients() {
-        let (n, age) = c.backlog();
-        if n == 0 {
-            continue;
-        }
-        let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
-            0 => 40,
-            r => r,
-        } as f64;
-        // Enough frames in flight to cover one RTT plus decode, but never more than ~rtt+120ms of queue.
-        let max_n = (((rtt + 40.0) / interval_ms).ceil() as usize + 2).clamp(3, 40);
-        let max_age = rtt as u128 + 120;
-        if age > 4000 {
-            // Stalled client (hidden tab, dead socket): stop letting it gate everyone.
-            log::warn!(
-                "client {} stalled ({} frames, {} ms); resyncing",
-                c.id,
-                n,
-                age
-            );
-            c.inflight.lock().clear();
-            c.needs_keyframe.store(true, Ordering::Relaxed);
-            c.started.store(false, Ordering::Relaxed);
-            continue;
-        }
-        if n >= max_n || age > max_age {
-            return false;
-        }
-    }
-    true
 }
 
 /// Delay-based bitrate adaptation: back off toward the measured delivery rate when
@@ -264,12 +279,8 @@ impl RateCtl {
                 continue;
             }
             let q = c.delay.lock().queue_ms;
-            let (_, age) = c.backlog();
-            let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
-                0 => 40,
-                r => r,
-            } as f64;
-            if q > 30.0 || age as f64 > rtt + 80.0 {
+            // Ack age is the decoder as well as the network. Queue time is the congestion signal.
+            if q > 30.0 {
                 congested = true;
                 let r = c.delivered.lock().rate_bps / 1000.0;
                 if r > 0.0 {
@@ -456,6 +467,29 @@ fn note_changes(cap: &mut Capturer, hub: &Hub) {
     }
 }
 
+fn take_bands(cap: &mut Capturer) -> Result<Vec<Band>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        cap.take_bands()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(cap.take_damage()?.into_iter().collect())
+    }
+}
+
+fn grab_frame(cap: &mut Capturer, band: Band) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        cap.grab(band)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        cap.grab(band)?;
+        Ok(true)
+    }
+}
+
 fn capture_loop(
     cap: &mut Capturer,
     cfg: VideoConfig,
@@ -468,7 +502,7 @@ fn capture_loop(
         Some(Box::new(I420::new(w, h))),
         Some(Box::new(I420::new(w, h))),
     ];
-    let mut pending: [Option<Band>; 2] = [Some(cap.full()), Some(cap.full())];
+    let mut pending: [Vec<Band>; 2] = [vec![cap.full()], vec![cap.full()]];
     let mut next_idx = 0usize;
     let interval = Duration::from_secs_f64(1.0 / cfg.fps as f64);
     // Allow slight early capture so source jitter doesn't alias into dropped frames.
@@ -532,9 +566,9 @@ fn capture_loop(
             .any(|c| c.needs_keyframe.load(Ordering::Relaxed));
         if !had_clients {
             had_clients = true;
-            // Our shm copy may be stale: re-grab everything once.
-            cap.grab(cap.full())?;
-            pending = [Some(cap.full()), Some(cap.full())];
+            // The first viewer needs a full frame in the capture buffer.
+            let _ = grab_frame(cap, cap.full())?;
+            pending = [vec![cap.full()], vec![cap.full()]];
             cap.damaged = true;
             full_next = true;
         }
@@ -570,7 +604,7 @@ fn capture_loop(
                 continue;
             }
         }
-        if !want_key && !flow_ok(&hub, interval_ms) {
+        if !any_ready(&hub, interval_ms) {
             hub.stats.flow_blocked.fetch_add(1, Ordering::Relaxed);
             wait_any(&[cap.fd(), hub.waker.waitable()], 4);
             continue;
@@ -591,28 +625,43 @@ fn capture_loop(
         hub.stats
             .damage_wait_us
             .fetch_add((t0 - origin).as_micros() as u64, Ordering::Relaxed);
-        let mut band = None;
-        let mut mb_dirty = (!full_next).then(|| cap.take_mb_map());
-        if full_next {
-            cap.take_mb_map();
-            full_next = false;
+        let mut bands = Vec::new();
+        if cap.damaged {
+            bands = take_bands(cap)?;
+            let mut held = true;
+            for b in &bands {
+                if !grab_frame(cap, *b)? {
+                    held = false;
+                    break;
+                }
+            }
+            if !held {
+                // The pixels moved on without this damage. Drop the map and wait.
+                bands.clear();
+                let _ = cap.take_mb_map();
+                continue;
+            }
         }
+        let mut mb_dirty = if full_next {
+            let _ = cap.take_mb_map();
+            full_next = false;
+            None
+        } else if bands.is_empty() {
+            let _ = cap.take_mb_map();
+            None
+        } else {
+            Some(cap.take_mb_map())
+        };
         match &mb_dirty {
             Some(m) => refiner.mark(m),
             None => refiner.mark_all(),
         }
-        if cap.damaged {
-            band = cap.take_damage()?;
-            if let Some(b) = band {
-                cap.grab(b)?;
-            }
-        }
         let t1 = Instant::now();
         if debug_marker {
             log::info!(
-                "cap dt {:.1} ms band {:?} grab {} us",
+                "cap dt {:.1} ms bands {} grab {} us",
                 last_capture.elapsed().as_secs_f64() * 1000.0,
-                band,
+                bands.len(),
                 (t1 - t0).as_micros()
             );
         }
@@ -620,7 +669,7 @@ fn capture_loop(
             Some((px, stride)) if debug_marker => marker_probe(px, stride, "grab"),
             _ => -1,
         };
-        let is_motion = band.is_some();
+        let is_motion = !bands.is_empty();
         if !is_motion && !want_key && !paintover_due {
             // Damage was empty after all.
             continue;
@@ -639,15 +688,12 @@ fn capture_loop(
         };
         let idx = next_idx;
         let mut buf = pool[idx].take().unwrap();
-        let todo = match (pending[idx], band) {
-            (p, Some(b)) => Some(union(p, b)),
-            (p, None) => p,
-        };
-        if let Some(b) = band {
-            pending[1 - idx] = Some(union(pending[1 - idx], b));
+        let mut todo = std::mem::take(&mut pending[idx]);
+        for b in &bands {
+            push_band(&mut todo, *b);
+            push_band(&mut pending[1 - idx], *b);
         }
-        pending[idx] = None;
-        if let Some(t) = todo {
+        for t in &todo {
             cap.convert(&mut buf, t.y0 as usize, t.y1 as usize, cfg.convert_threads);
         }
         let t2 = Instant::now();
@@ -685,21 +731,16 @@ fn capture_loop(
             refiner.clear_all();
         }
         // A refinement frame encodes what moved plus what is due; everything else stays skipped.
+        let mut job_bands = todo;
         let mb_map = if want_key {
             None
         } else if frame_paintover {
             paint_map.map(|(m, b)| {
-                band = Some(match band {
-                    Some(x) => union(Some(x), b),
-                    None => b,
-                });
+                push_band(&mut job_bands, b);
                 Arc::new(m)
             })
         } else if let Some((rmap, rband)) = refine.take() {
-            band = Some(match band {
-                Some(b) => union(Some(b), rband),
-                None => rband,
-            });
+            push_band(&mut job_bands, rband);
             let mut m = mb_dirty.take().unwrap_or_else(|| vec![1; rmap.len()]);
             for (d, r) in m.iter_mut().zip(rmap) {
                 *d |= r;
@@ -719,7 +760,7 @@ fn capture_loop(
                 paintover,
                 paintover_final: frame_paintover && paintover_left == 0,
                 mb_dirty: mb_map,
-                band,
+                bands: job_bands,
                 captured_at: origin,
                 marker_ms,
             })
@@ -986,6 +1027,7 @@ fn encode_loop(
     hub: Arc<Hub>,
     crf: f32,
     po_crf: f32,
+    interval_ms: f64,
 ) {
     let epoch = Instant::now();
     let mut frame_id: u32 = 0;
@@ -1015,9 +1057,7 @@ fn encode_loop(
             .map(|&(y, h, touched)| {
                 job.force_idr
                     || (job.paintover && touched)
-                    || job
-                        .band
-                        .is_some_and(|b| (b.y0 as usize) < y + h && (b.y1 as usize) > y)
+                    || band_hits(&job.bands, y, h)
             })
             .collect();
         if !selected.iter().any(|&x| x) {
@@ -1063,10 +1103,7 @@ fn encode_loop(
             if job.paintover_final {
                 *touched = false;
             }
-            if job
-                .band
-                .is_some_and(|b| (b.y0 as usize) < *y + *h && (b.y1 as usize) > *y)
-            {
+            if band_hits(&job.bands, *y, *h) {
                 *touched = true;
             }
         }
@@ -1116,6 +1153,16 @@ fn encode_loop(
             .collect();
         let now = Instant::now();
         for c in hub.video_clients() {
+            if !client_ready(&c, interval_ms) {
+                // This viewer is past the window. Others still receive the frame.
+                // A lone viewer never reaches here: capture waits instead of skipping deltas.
+                if c.started.load(Ordering::Relaxed) {
+                    c.started.store(false, Ordering::Relaxed);
+                    c.needs_keyframe.store(true, Ordering::Relaxed);
+                    c.send(Out::DropVideo);
+                }
+                continue;
+            }
             if !c.started.load(Ordering::Relaxed) {
                 if !all_key {
                     continue;

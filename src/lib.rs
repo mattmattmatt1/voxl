@@ -198,7 +198,7 @@ async fn serve(a: HashMap<String, String>) {
             "wayland (default)"
         };
         log::info!("desktop backend: {label}; asking the compositor to share the screen");
-        if let Err(e) = wl::start().await {
+        if let Err(e) = wl::start(vcfg.fps.max(1)).await {
             if backend::explicit() {
                 log::error!("wayland capture failed: {e}");
                 std::process::exit(1);

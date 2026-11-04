@@ -220,12 +220,47 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     }
     let writer = tokio::spawn(async move {
         let dbg = std::env::var("VOXL_DEBUG_MARKER").is_ok();
+        // After a stall, skip H.264 deltas already queued for this socket until a keyframe.
+        let mut skip_delta = false;
         while let Some(m) = rx.recv().await {
+            if matches!(m, Out::DropVideo) {
+                skip_delta = true;
+                while let Ok(queued) = rx.try_recv() {
+                    match queued {
+                        Out::DropVideo => {}
+                        Out::Bin(b) if video_delta(&b) => {}
+                        Out::Bin(b) if video_key(&b) => {
+                            skip_delta = false;
+                            if sink.send(Message::Binary(b)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Out::Bin(b) => {
+                            if sink.send(Message::Binary(b)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Out::Text(t) => {
+                            if sink.send(Message::Text(t.into())).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             let t = Instant::now();
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
             let msg = match m {
-                Out::Bin(b) => Message::Binary(b),
+                Out::Bin(b) if skip_delta && video_delta(&b) => continue,
+                Out::Bin(b) => {
+                    if video_key(&b) {
+                        skip_delta = false;
+                    }
+                    Message::Binary(b)
+                }
                 Out::Text(t) => Message::Text(t.into()),
+                Out::DropVideo => continue,
             };
             if sink.send(msg).await.is_err() {
                 break;
@@ -291,6 +326,14 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     }
     s.hub.remove_client(client.id);
     log::info!("client {} disconnected", client.id);
+}
+
+fn video_delta(b: &[u8]) -> bool {
+    b.first() == Some(&0x01) && b.len() > 1 && b[1] & 1 == 0
+}
+
+fn video_key(b: &[u8]) -> bool {
+    b.first() == Some(&0x01) && b.len() > 1 && b[1] & 1 == 1
 }
 
 fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
@@ -396,6 +439,15 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
             }
         }
         "kf" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let prev = c.last_kf_ms.load(Ordering::Relaxed);
+            if now.saturating_sub(prev) < 500 {
+                return;
+            }
+            c.last_kf_ms.store(now, Ordering::Relaxed);
             c.started.store(false, Ordering::Relaxed);
             c.needs_keyframe.store(true, Ordering::Relaxed);
             s.hub.wake();

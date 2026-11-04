@@ -84,7 +84,13 @@ function main() {
 	const useVideo =
 		params.get('present') !== 'canvas' &&
 		typeof MediaStreamTrackGenerator !== 'undefined';
-	const video = createVideo(app, canvas, useVideo, cursor.apply);
+	const video = createVideo(
+		app,
+		canvas,
+		useVideo,
+		() => cursor.apply(),
+		(w, h) => post({ t: 'view', w, h })
+	);
 	const clipboard = createClipboard(app);
 	const audio = createAudio(app);
 	// Browsers only allow audio and clipboard writes after a user gesture.
@@ -129,7 +135,7 @@ function main() {
 		const m = e.data;
 		switch (m.t) {
 			case 'frames':
-				video.present(m.parts);
+				video.present(m.id, m.parts, (id) => post({ t: 'presented', id }));
 				break;
 			case 'hello':
 				app.desk.w = m.w;

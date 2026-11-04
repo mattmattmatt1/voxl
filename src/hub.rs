@@ -11,6 +11,8 @@ use tokio::sync::mpsc;
 pub enum Out {
     Bin(Bytes),
     Text(String),
+    /// Drop queued video deltas on this client. The next keyframe is kept.
+    DropVideo,
 }
 
 pub struct Inflight {
@@ -32,6 +34,8 @@ pub struct Client {
     pub needs_keyframe: AtomicBool,
     /// Has received a keyframe since (re)starting video.
     pub started: AtomicBool,
+    /// Last accepted `kf` command, unix millis. The server ignores a tighter loop.
+    pub last_kf_ms: AtomicU64,
     pub delay: Mutex<DelayEst>,
 }
 
@@ -307,6 +311,7 @@ impl Hub {
             }),
             needs_keyframe: AtomicBool::new(true),
             started: AtomicBool::new(false),
+            last_kf_ms: AtomicU64::new(0),
             delay: Mutex::new(DelayEst {
                 base_ms: f64::MAX,
                 base_at: Instant::now(),

@@ -16,6 +16,15 @@ declare const self: DedicatedWorkerGlobalScope;
 
 const noDraw = /nodraw/.test(self.location.search);
 let presentToMain = false;
+let deskW = 0;
+let deskH = 0;
+let viewW = 0;
+let viewH = 0;
+/** One <video> write at a time. A newer frame waits and is acked with it. */
+let presentBusy = false;
+let pendingAck = 0;
+let accel: 'prefer-hardware' | 'prefer-software' = 'prefer-hardware';
+let accelFallback = false;
 let ws: WebSocket | null = null;
 let url = '';
 let canvas: OffscreenCanvas | null = null;
@@ -137,11 +146,12 @@ function onText(s: string) {
 		return;
 	}
 	if (m.t === 'hello' && canvas) {
-		if (canvas.width !== m.w || canvas.height !== m.h) {
-			canvas.width = m.w;
-			canvas.height = m.h;
+		deskW = m.w;
+		deskH = m.h;
+		if (!presentToMain) {
+			sizeCanvas();
+			if (!ctx) ctx = context2d(canvas);
 		}
-		if (!ctx) ctx = context2d(canvas);
 		layout = m.stripes && m.stripes.length ? m.stripes : [[0, m.h]];
 		resetDecoder();
 	}
@@ -215,6 +225,10 @@ function makeDecoder(i: number, codec: string): VideoDecoder {
 		},
 		error: (e) => {
 			post({ t: 'log', s: `stripe ${i} decoder error: ${e.message}` });
+			if (!accelFallback && accel === 'prefer-hardware') {
+				accelFallback = true;
+				accel = 'prefer-software';
+			}
 			resetDecoder();
 			requestKeyframe();
 		},
@@ -222,36 +236,86 @@ function makeDecoder(i: number, codec: string): VideoDecoder {
 	dec.configure({
 		codec,
 		optimizeForLatency: true,
-		hardwareAcceleration: 'no-preference',
+		hardwareAcceleration: accel,
 	});
 	return dec;
 }
 
-/** Present every complete frame at the head of the queue. */
+/** Bitmap is the on-screen device pixels, never a full-desktop buffer for a small window. */
+function sizeCanvas() {
+	if (!canvas || presentToMain || !deskW || !deskH) return;
+	const bw = Math.max(1, Math.min(viewW || deskW, deskW));
+	const bh = Math.max(1, Math.min(viewH || deskH, deskH));
+	if (canvas.width === bw && canvas.height === bh) return;
+	const resize = canvas.width > 0 && canvas.height > 0;
+	canvas.width = bw;
+	canvas.height = bh;
+	if (resize) requestKeyframe();
+}
+
+function drawStripe(g: StripeFrame) {
+	if (!ctx || !canvas || !deskH || noDraw) {
+		g.frame.close();
+		return;
+	}
+	const sh = layout[g.i] ? layout[g.i][1] : deskH;
+	const sy = canvas.height / deskH;
+	ctx.drawImage(
+		g.frame,
+		0,
+		Math.round(g.y * sy),
+		canvas.width,
+		Math.max(1, Math.round(sh * sy))
+	);
+	g.frame.close();
+}
+
+/** Present the newest complete frames. Older complete ones are closed and covered by one ack. */
 function flush() {
+	const ready: { id: number; f: PendingFrame }[] = [];
 	while (order.length) {
 		const id = order[0];
 		const f = frames.get(id);
-		if (f && f.got.length < f.need) return;
+		if (f && f.got.length < f.need) break;
 		order.shift();
 		frames.delete(id);
-		if (!f) continue;
-		if (f.got.length) {
-			if (presentToMain)
-				post(
-					{ t: 'frames', parts: f.got },
-					f.got.map((g) => g.frame)
-				);
-			else
-				for (const g of f.got) {
-					if (ctx && !noDraw) ctx.drawImage(g.frame, 0, g.y);
-					g.frame.close();
-				}
+		if (f) ready.push({ id, f });
+	}
+	if (!ready.length) return;
+	const last = ready[ready.length - 1];
+	for (const r of ready) {
+		if (r === last) continue;
+		for (const g of r.f.got) g.frame.close();
+		st.dropped++;
+	}
+	const id = last.id;
+	const f = last.f;
+	if (presentToMain) {
+		if (presentBusy) {
+			for (const g of f.got) g.frame.close();
+			pendingAck = id;
+			return;
 		}
+		presentBusy = true;
+		pendingAck = id;
+		post({ t: 'frames', id, parts: f.got }, f.got.map((g) => g.frame));
+		return;
+	}
+	for (const g of f.got) drawStripe(g);
+	send(cmd.ack(id));
+	st.frames++;
+	st.decodeMs += performance.now() - f.t0;
+}
+
+function onPresented() {
+	presentBusy = false;
+	const id = pendingAck;
+	pendingAck = 0;
+	if (id) {
 		send(cmd.ack(id));
 		st.frames++;
-		st.decodeMs += performance.now() - f.t0;
 	}
+	flush();
 }
 
 function onVideo(b: Uint8Array) {
@@ -286,10 +350,23 @@ function onVideo(b: Uint8Array) {
 			try {
 				sd.dec = makeDecoder(h.stripe, codec);
 			} catch (e) {
-				post({ t: 'log', s: 'configure failed ' + e });
-				f.need--;
-				flush();
-				return;
+				if (!accelFallback && accel === 'prefer-hardware') {
+					accelFallback = true;
+					accel = 'prefer-software';
+					try {
+						sd.dec = makeDecoder(h.stripe, codec);
+					} catch (e2) {
+						post({ t: 'log', s: 'configure failed ' + e2 });
+						f.need--;
+						flush();
+						return;
+					}
+				} else {
+					post({ t: 'log', s: 'configure failed ' + e });
+					f.need--;
+					flush();
+					return;
+				}
 			}
 		}
 		sd.waitingKey = false;
@@ -381,8 +458,16 @@ self.addEventListener('message', (e: MessageEvent<ToWorker>) => {
 			canvas = m.canvas;
 			url = m.url;
 			presentToMain = m.presentToMain;
-			ctx = context2d(canvas);
+			if (!presentToMain) ctx = context2d(canvas);
 			connect();
+			break;
+		case 'presented':
+			onPresented();
+			break;
+		case 'view':
+			viewW = m.w;
+			viewH = m.h;
+			sizeCanvas();
 			break;
 		case 'send':
 			send(m.d);

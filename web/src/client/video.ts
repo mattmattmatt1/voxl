@@ -7,6 +7,7 @@ interface StripeOut {
 	writer: WritableStreamDefaultWriter<VideoFrame>;
 	writing: boolean;
 	next: VideoFrame | null;
+	onDone?: () => void;
 }
 
 /**
@@ -16,10 +17,15 @@ interface StripeOut {
  * in one message so they are written to their tracks together.
  */
 // At most one write in flight per track; a newer frame replaces a waiting one.
-function write(o: StripeOut, frame: VideoFrame) {
+// `onDone` runs when this frame's write has settled, or when a newer one takes its place in the queue.
+function write(o: StripeOut, frame: VideoFrame, onDone: () => void) {
 	if (o.writing) {
-		o.next?.close();
+		if (o.next) {
+			o.next.close();
+			o.onDone?.();
+		}
 		o.next = frame;
+		o.onDone = onDone;
 		return;
 	}
 	o.writing = true;
@@ -29,10 +35,11 @@ function write(o: StripeOut, frame: VideoFrame) {
 		.finally(() => {
 			o.writing = false;
 			const next = o.next;
-			if (next) {
-				o.next = null;
-				write(o, next);
-			}
+			const nextDone = o.onDone;
+			o.next = null;
+			o.onDone = undefined;
+			onDone();
+			if (next && nextDone) write(o, next, nextDone);
 		});
 }
 
@@ -42,7 +49,8 @@ export function createVideo(
 	app: App,
 	canvas: HTMLCanvasElement,
 	useVideo: boolean,
-	onLayout: () => void
+	onLayout: () => void,
+	onView?: (w: number, h: number) => void
 ) {
 	let outs: StripeOut[] = [];
 	let stripes: Stripe[] = [[0, 1]];
@@ -75,12 +83,32 @@ export function createVideo(
 		}
 	}
 
-	function present(parts: StripeFrame[]) {
+	function present(id: number, parts: StripeFrame[], onDone: (id: number) => void) {
+		if (!useVideo || !outs.length) {
+			for (const p of parts) p.frame.close();
+			onDone(id);
+			return;
+		}
+		let left = 0;
+		let finished = false;
+		const done = () => {
+			if (finished) return;
+			left--;
+			if (left <= 0) {
+				finished = true;
+				onDone(id);
+			}
+		};
 		for (const p of parts) {
 			const o = outs[p.i];
-			if (o) write(o, p.frame);
-			else p.frame.close();
+			if (!o) {
+				p.frame.close();
+				continue;
+			}
+			left++;
+			write(o, p.frame, done);
 		}
+		if (left === 0) onDone(id);
 	}
 
 	function layout() {
@@ -99,6 +127,7 @@ export function createVideo(
 		app.view.scale = devH / dpr / dh;
 		app.surface.style.width = `${dw * app.view.scale}px`;
 		app.surface.style.height = `${dh * app.view.scale}px`;
+		onView?.(Math.max(1, Math.round((dw * devH) / dh)), devH);
 		onLayout();
 	}
 

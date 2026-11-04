@@ -26,6 +26,9 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub serial: u64,
+    /// Rectangles that differ from the previous published frame, in pixels.
+    /// One full-screen rect means the comparison found changes everywhere.
+    pub damage: Vec<(u32, u32, u32, u32)>,
 }
 
 pub struct Shared {
@@ -60,7 +63,7 @@ struct Handoff {
 }
 
 /// Opens the portal, starts the PipeWire capture thread, and returns once a frame exists.
-pub async fn start() -> Result<(), String> {
+pub async fn start(max_fps: u32) -> Result<(), String> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let portal_task = tokio::spawn(async move {
@@ -98,10 +101,11 @@ pub async fn start() -> Result<(), String> {
             width: 0,
             height: 0,
             serial: 0,
+            damage: Vec::new(),
         }),
         wake,
     });
-    if let Err(e) = pw::spawn(shared.clone(), handoff.fd, handoff.node) {
+    if let Err(e) = pw::spawn(shared.clone(), handoff.fd, handoff.node, max_fps.max(1)) {
         return Err(fail(portal_task, e).await);
     }
     let deadline = Instant::now() + Duration::from_secs(8);

@@ -18,9 +18,12 @@ pub struct Capturer {
     pub damaged_at: Option<Instant>,
     acc: Option<(u32, u32)>,
     mb_dirty: Vec<u8>,
+    mb_spare: Vec<u8>,
     mb_cols: usize,
     pub changes: Vec<(u32, u32, u32, u32)>,
     resize_pending: bool,
+    /// Serial whose pixels are currently in `buf`.
+    grabbed: u64,
 }
 
 impl Capturer {
@@ -45,9 +48,11 @@ impl Capturer {
             damaged_at: None,
             acc: None,
             mb_dirty: vec![0; mb_cols * (height as usize).div_ceil(16)],
+            mb_spare: Vec::new(),
             mb_cols,
             changes: Vec::new(),
             resize_pending: false,
+            grabbed: 0,
         };
         cap.pump()?;
         if cap.seen == 0 {
@@ -77,14 +82,19 @@ impl Capturer {
             self.resize_pending = true;
             return Ok(());
         }
-        let n = self.stride * self.height as usize;
-        if frame.bgrx.len() < n {
+        if frame.bgrx.len() < self.stride * self.height as usize {
             return Ok(());
         }
-        self.buf[..n].copy_from_slice(&frame.bgrx[..n]);
+        let damage = frame.damage.clone();
         self.seen = frame.serial;
         drop(frame);
-        self.note(0, 0, self.width, self.height);
+        if damage.is_empty() {
+            self.note(0, 0, self.width, self.height);
+        } else {
+            for (left, top, right, bot) in damage {
+                self.note(left, top, right, bot);
+            }
+        }
         Ok(())
     }
 
@@ -106,6 +116,7 @@ impl Capturer {
         super::DAMAGE_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
     pub fn take_damage(&mut self) -> Result<Option<Band>, String> {
         self.damaged = false;
         self.damaged_at = None;
@@ -118,9 +129,22 @@ impl Capturer {
         }))
     }
 
+    pub fn take_bands(&mut self) -> Vec<super::Band> {
+        self.damaged = false;
+        self.damaged_at = None;
+        self.acc = None;
+        super::bands_from_mb(&self.mb_dirty, self.mb_cols, self.height)
+    }
+
     pub fn take_mb_map(&mut self) -> Vec<u8> {
         let n = self.mb_dirty.len();
-        std::mem::replace(&mut self.mb_dirty, vec![0; n])
+        let mut spare = std::mem::take(&mut self.mb_spare);
+        if spare.len() != n {
+            spare.resize(n, 0);
+        }
+        spare.fill(0);
+        std::mem::swap(&mut spare, &mut self.mb_dirty);
+        spare
     }
 
     pub fn full(&self) -> Band {
@@ -139,7 +163,9 @@ impl Capturer {
         if self.resize_pending {
             return Err("wayland size changed during screenshot".into());
         }
-        self.grab(self.full())?;
+        if !self.grab(self.full())? {
+            return Err("wayland frame changed during screenshot".into());
+        }
         Ok(self.buf.clone())
     }
 
@@ -156,26 +182,27 @@ impl Capturer {
         frame.width != self.width || frame.height != self.height
     }
 
-    /// The PipeWire thread already stored a full BGRX frame. Copy the band in case a
-    /// newer one landed after `pump`.
-    pub fn grab(&mut self, band: Band) -> Result<(), String> {
-        let frame = self.shared.frame.lock();
+    /// Swap in the frame `pump` observed. A newer serial means those damage rects
+    /// describe a frame we no longer have, so the caller drops them.
+    /// `band` selects rows for the X11 capturer; Wayland publishes a whole frame.
+    pub fn grab(&mut self, _band: Band) -> Result<bool, String> {
+        let mut frame = self.shared.frame.lock();
         if frame.width != self.width || frame.height != self.height {
             self.resize_pending = true;
-            return Ok(());
+            return Ok(false);
         }
-        let y0 = band.y0.min(self.height) as usize;
-        let y1 = band.y1.min(self.height) as usize;
-        let row = self.stride;
-        let need = y1.saturating_mul(row);
-        if frame.bgrx.len() < need || self.buf.len() < need {
-            return Ok(());
+        if frame.serial != self.seen {
+            return Ok(false);
         }
-        for y in y0..y1 {
-            let off = y * row;
-            self.buf[off..off + row].copy_from_slice(&frame.bgrx[off..off + row]);
+        if self.grabbed == self.seen {
+            return Ok(true);
         }
-        self.seen = frame.serial;
-        Ok(())
+        let n = self.stride * self.height as usize;
+        if frame.bgrx.len() < n || self.buf.len() < n {
+            return Ok(false);
+        }
+        std::mem::swap(&mut frame.bgrx, &mut self.buf);
+        self.grabbed = self.seen;
+        Ok(true)
     }
 }

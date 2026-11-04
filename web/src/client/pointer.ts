@@ -9,23 +9,51 @@ const BUTTONS = [1, 2, 3, 8, 9];
 export function setupPointer(app: App, onInteract: () => void) {
 	const { surface, send } = app;
 
+	let rect = surface.getBoundingClientRect();
+	const refreshRect = () => {
+		rect = surface.getBoundingClientRect();
+	};
+	window.addEventListener('resize', refreshRect);
 	function toDesk(p: { clientX: number; clientY: number }): [number, number] {
-		const r = surface.getBoundingClientRect();
-		const x = Math.round(((p.clientX - r.left) * app.desk.w) / r.width);
-		const y = Math.round(((p.clientY - r.top) * app.desk.h) / r.height);
+		const x = Math.round(((p.clientX - rect.left) * app.desk.w) / (rect.width || 1));
+		const y = Math.round(((p.clientY - rect.top) * app.desk.h) / (rect.height || 1));
 		return [
 			Math.max(0, Math.min(app.desk.w - 1, x)),
 			Math.max(0, Math.min(app.desk.h - 1, y)),
 		];
 	}
 	let lastMove = '';
-	function move(p: { clientX: number; clientY: number }, force = false) {
+	let pendingMove: { clientX: number; clientY: number } | null = null;
+	let moveQueued = false;
+	function sendMove(p: { clientX: number; clientY: number }, force = false) {
 		if (!app.desk.w) return;
 		const s = cmd.move(...toDesk(p));
 		if (s !== lastMove || force) {
 			lastMove = s;
 			send(s);
 		}
+	}
+	function flushMove() {
+		moveQueued = false;
+		const p = pendingMove;
+		pendingMove = null;
+		if (!p) return;
+		refreshRect();
+		sendMove(p);
+	}
+	/** Last position in a frame wins. Buttons flush the pending move first. */
+	function move(p: { clientX: number; clientY: number }, force = false) {
+		if (force) {
+			pendingMove = null;
+			moveQueued = false;
+			refreshRect();
+			sendMove(p, true);
+			return;
+		}
+		pendingMove = p;
+		if (moveQueued) return;
+		moveQueued = true;
+		requestAnimationFrame(flushMove);
 	}
 
 	// Scroll is sent in desktop pixels, batched per frame; the server turns it into
@@ -47,7 +75,10 @@ export function setupPointer(app: App, onInteract: () => void) {
 		});
 	}
 	/** Desktop pixels per on-screen pixel. */
-	const deskPerPx = () => app.desk.w / surface.getBoundingClientRect().width;
+	const deskPerPx = () => {
+		refreshRect();
+		return app.desk.w / (rect.width || 1);
+	};
 
 	const touch = createTouch(app, {
 		moveTo: (x, y) => move({ clientX: x, clientY: y }, true),
